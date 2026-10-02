@@ -20,6 +20,7 @@ module Net
 
     def teardown
       FakeServer.stop_all
+      PipeliningFakeServer.stop_all
     end
 
     def test_critical
@@ -620,6 +621,123 @@ module Net
       assert_equal "MAIL FROM:<rené@example.com> SMTPUTF8\r\n", server.commands.last
     end
 
+    def test_send_message_pipelined
+      server = PipeliningFakeServer.start
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        results = smtp.send_message_pipelined('message', 'foo@example.com',
+                                              'a@example.com', 'b@example.com', 'c@example.com')
+        assert_equal %w[a@example.com b@example.com c@example.com], results.map(&:first)
+        assert results.all? {|_addr, res| res.success? }
+      end
+      assert_equal "message\r\n", server.body
+      assert_replies_match_commands(server)
+    end
+
+    def test_send_message_pipelined_mail_failure
+      server = PipeliningFakeServer.start(mail_reply: "550 5.7.1 Sender rejected\r\n")
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        exc = assert_raise(Net::SMTPFatalError) do
+          smtp.send_message_pipelined('message', 'foo@example.com', 'a@example.com', 'b@example.com')
+        end
+        assert_equal '550', exc.response.status
+        # the pipelined RCPT replies were drained, so the session is still in sync
+        smtp.rset
+      end
+      commands = server.commands.map(&:chomp)
+      assert_equal 1, commands.grep(/\AMAIL FROM:/).size
+      assert_equal 2, commands.grep(/\ARCPT TO:/).size
+      assert_equal 0, commands.grep('DATA').size
+      assert_replies_match_commands(server)
+    end
+
+    def test_send_message_pipelined_partial_rcpt_reject
+      server = PipeliningFakeServer.start(rcpt_reply: ->(addr) {
+        addr.start_with?('bad') ? "550 5.1.1 Mailbox unavailable\r\n" : "250 2.1.5 Ok\r\n"
+      })
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        results = smtp.send_message_pipelined('message', 'foo@example.com',
+                                              'good@example.com', 'bad@example.com', 'good2@example.com')
+        assert_equal %w[good@example.com bad@example.com good2@example.com], results.map(&:first)
+        assert_equal [true, false, true], results.map {|_addr, res| res.success? }
+        assert_equal '550', results[1][1].status
+      end
+      assert_equal "message\r\n", server.body
+      assert_replies_match_commands(server)
+    end
+
+    def test_send_message_pipelined_all_rcpt_rejected
+      server = PipeliningFakeServer.start(rcpt_reply: ->(_addr) { "550 5.1.1 Mailbox unavailable\r\n" })
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        results = smtp.send_message_pipelined('message', 'foo@example.com', 'a@example.com', 'b@example.com')
+        assert_equal 2, results.size
+        assert results.none? {|_addr, res| res.success? }
+        # no DATA was sent, but the session is still in sync
+        smtp.rset
+      end
+      assert_equal 0, server.commands.map(&:chomp).grep('DATA').size
+      assert_equal '', server.body
+      assert_replies_match_commands(server)
+    end
+
+    def test_send_message_pipelined_delayed_fragmented_replies
+      server = PipeliningFakeServer.start(reply_delay: 0.05, fragment: true)
+      recipients = (1..10).map {|i| "user#{i}@example.com" }
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        results = smtp.send_message_pipelined('message', 'foo@example.com', *recipients)
+        assert_equal recipients, results.map(&:first)
+        assert results.all? {|_addr, res| res.success? }
+      end
+      assert_equal 10, server.commands.map(&:chomp).grep(/\ARCPT TO:/).size
+      assert_equal "message\r\n", server.body
+      assert_replies_match_commands(server)
+    end
+
+    def test_send_message_pipelined_without_capability_falls_back_to_serial
+      server = PipeliningFakeServer.start(pipelining: false)
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        results = smtp.send_message_pipelined('message', 'foo@example.com', 'a@example.com', 'b@example.com')
+        assert_equal 2, results.size
+        assert results.all? {|_addr, res| res.success? }
+      end
+      assert_equal "message\r\n", server.body
+      assert_replies_match_commands(server)
+    end
+
+    def test_send_message_pipelined_without_capability_raises_on_rcpt_reject
+      server = PipeliningFakeServer.start(pipelining: false,
+                                          rcpt_reply: ->(_addr) { "550 5.1.1 Mailbox unavailable\r\n" })
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        assert_raise(Net::SMTPFatalError) do
+          smtp.send_message_pipelined('message', 'foo@example.com', 'a@example.com')
+        end
+      end
+      assert_equal '', server.body
+    end
+
+    def test_open_message_stream_pipelined
+      server = PipeliningFakeServer.start
+      consumed = false
+      Net::SMTP.start('localhost', server.port) do |smtp|
+        results = smtp.open_message_stream_pipelined('foo@example.com', 'a@example.com') do |f|
+          consumed = true
+          f.write 'block message'
+        end
+        assert_equal 1, results.size
+        assert results[0][1].success?
+      end
+      assert consumed
+      assert_equal "block message\r\n", server.body
+      assert_equal false, server.premature_body
+      assert_replies_match_commands(server)
+    end
+
+    # Every command gets exactly one reply, plus the intermediate 354
+    # reply for each DATA command.
+    def assert_replies_match_commands(server)
+      data_commands = server.commands.count {|c| c.chomp == 'DATA' }
+      assert_equal server.commands.size + data_commands, server.replies
+    end
+
     def fake_server_start(**kw)
       server = FakeServer.new
       server.start(**kw)
@@ -817,6 +935,115 @@ module Net
       end
     rescue Errno::ECONNRESET, Errno::ECONNABORTED
       nil
+    end
+  end
+
+  # A fake server that advertises PIPELINING (unless disabled) and
+  # handles pipelined envelope commands.  Every reply can be delayed
+  # and/or fragmented into single-byte writes.  It counts the replies
+  # it sent, so tests can assert that the client consumed exactly one
+  # reply per command it sent.
+  class PipeliningFakeServer
+    @servers = []
+
+    def self.start(**kw)
+      server = new(**kw)
+      @servers.push server
+      server.start
+      server
+    end
+
+    def self.stop_all
+      while (s = @servers.shift)
+        s.stop
+      end
+    end
+
+    attr_reader :port, :commands, :replies, :body, :premature_body
+
+    def initialize(pipelining: true, mail_reply: "250 2.1.0 Ok\r\n",
+                   rcpt_reply: nil, reply_delay: 0, fragment: false)
+      @pipelining = pipelining
+      @mail_reply = mail_reply
+      @rcpt_reply = rcpt_reply || ->(_addr) { "250 2.1.5 Ok\r\n" }
+      @reply_delay = reply_delay
+      @fragment = fragment
+    end
+
+    def start
+      @commands = []
+      @replies = 0
+      @body = +''
+      @premature_body = false
+      @server_sockets = Socket.tcp_server_sockets('localhost', 0)
+      @port = @server_sockets[0].local_address.ip_port
+      @thread = Thread.start do
+        Thread.current.abort_on_exception = true
+        @sock = Socket.accept_loop(@server_sockets) {|s, _| break s }
+        serve
+      end
+      self
+    end
+
+    def stop
+      @thread&.kill
+      @thread&.join
+      @server_sockets&.each(&:close)
+    end
+
+    private
+
+    def reply(str)
+      @replies += 1
+      sleep @reply_delay if @reply_delay > 0
+      if @fragment
+        str.each_char do |c|
+          @sock.write c
+          sleep 0.001
+        end
+      else
+        @sock.write str
+      end
+    end
+
+    def serve
+      @sock.write "220 ready\r\n"
+      while (comm = @sock.gets)
+        @commands.push comm
+        case comm.chomp
+        when /\AEHLO /
+          if @pipelining
+            reply "250-servername\r\n250-PIPELINING\r\n250 HELP\r\n"
+          else
+            reply "250 servername\r\n"
+          end
+        when /\AMAIL FROM:/
+          reply @mail_reply
+        when /\ARCPT TO:<(.+?)>/
+          reply @rcpt_reply.call($1)
+        when "DATA"
+          # The client must wait for the 354 reply before sending the
+          # message body; anything readable now was sent prematurely.
+          @premature_body = true if IO.select([@sock], nil, nil, 0.3)
+          reply "354 End data with <CR><LF>.<CR><LF>\r\n"
+          while (l = @sock.gets)
+            break if l.chomp == '.'
+            @body.concat l.sub(/\A\./, '')
+          end
+          reply "250 2.0.0 Ok: queued as ABCDEFG\r\n"
+        when "RSET"
+          reply "250 2.0.0 Ok\r\n"
+        when "QUIT"
+          reply "221 2.0.0 Bye\r\n"
+          break
+        else
+          reply "502 5.5.2 Error: command not recognized\r\n"
+        end
+      end
+    rescue Errno::ECONNRESET, Errno::ECONNABORTED, IOError
+      nil
+    ensure
+      @sock&.close rescue nil
     end
   end
 end

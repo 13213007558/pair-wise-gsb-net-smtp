@@ -293,6 +293,12 @@ module Net
       capable?('STARTTLS')
     end
 
+    # true if server advertises PIPELINING.
+    # You cannot get valid value before opening SMTP session.
+    def capable_pipelining?
+      capable?('PIPELINING')
+    end
+
     # true if the EHLO response contains +key+.
     def capable?(key)
       return nil unless @capabilities
@@ -854,6 +860,64 @@ module Net
     alias ready open_message_stream   # obsolete
 
     #
+    # Sends +msgstr+ as a message, using the PIPELINING extension
+    # [RFC2920[https://www.rfc-editor.org/rfc/rfc2920.txt]] to pipeline
+    # the envelope commands (+MAIL FROM+ and +RCPT TO+) when the server
+    # advertises it.  This saves one round trip per recipient, which
+    # matters when sending to many recipients.
+    #
+    # Returns an Array of +[recipient, Net::SMTP::Response]+ pairs, one
+    # for each recipient, so the caller can tell exactly which recipients
+    # were accepted or rejected by the server.  A rejected recipient does
+    # not raise; check the returned responses instead.
+    #
+    # If the +MAIL FROM+ command is rejected, its error is raised after
+    # every pipelined reply has been consumed, so the session stays
+    # synchronized with the server.  If every recipient is rejected, the
+    # message body is not sent at all.
+    #
+    # When the server does not advertise PIPELINING, this method falls
+    # back to the original serial behavior of #send_message (a rejected
+    # recipient then raises its error, as with #send_message).
+    #
+    # The message body is only read and sent after the server has
+    # accepted the envelope and the +DATA+ command, exactly like
+    # #send_message.
+    #
+    # === Errors
+    #
+    # This method may raise:
+    #
+    # * Net::SMTPServerBusy
+    # * Net::SMTPSyntaxError
+    # * Net::SMTPFatalError
+    # * Net::SMTPUnknownError
+    # * Net::ReadTimeout
+    # * IOError
+    #
+    def send_message_pipelined(msgstr, from_addr, *to_addrs)
+      results, any_accepted = pipelined_send_envelope(from_addr, to_addrs)
+      data msgstr if any_accepted
+      results
+    end
+
+    #
+    # Like #send_message_pipelined, but opens a message writer stream and
+    # gives it to the block, like #open_message_stream.  The block is
+    # only called after the server has accepted the envelope and the
+    # +DATA+ command, so a one-shot message source is never consumed
+    # before the server allows the message body.  Returns an Array of
+    # +[recipient, Net::SMTP::Response]+ pairs, as with
+    # #send_message_pipelined.
+    #
+    def open_message_stream_pipelined(from_addr, *to_addrs, &block)   # :yield: stream
+      raise ArgumentError, 'block is required' unless block
+      results, any_accepted = pipelined_send_envelope(from_addr, to_addrs)
+      data(&block) if any_accepted
+      results
+    end
+
+    #
     # Authentication
     #
 
@@ -1006,6 +1070,61 @@ module Net
       }
       check_response res
       res
+    end
+
+    # Sends the envelope commands for +from_addr+ and +to_addrs+ and
+    # returns [results, any_accepted], where results is an Array of
+    # [recipient, Net::SMTP::Response] pairs.  Uses PIPELINING when the
+    # server advertises it, otherwise falls back to the original serial
+    # behavior (which raises on a rejected recipient).
+    def pipelined_send_envelope(from_addr, to_addrs)
+      to_addrs.flatten!
+      raise IOError, 'closed session' unless @socket
+      from_addr = Address.new(from_addr, 'SMTPUTF8') if any_require_smtputf8(to_addrs) && capable?('SMTPUTF8')
+      if capable_pipelining?
+        pipelined_envelope(from_addr, to_addrs)
+      else
+        mailfrom from_addr
+        [to_addrs.map {|addr| [addr, rcptto(addr)] }, true]
+      end
+    end
+
+    # Sends MAIL FROM and all RCPT TO commands without waiting for
+    # individual replies, then consumes exactly one reply per command
+    # sent, in the order the commands were sent (RFC2920).  Returns
+    # [results, any_accepted], where results is an Array of
+    # [recipient, Net::SMTP::Response] pairs.
+    def pipelined_envelope(from_addr, to_addrs)
+      raise ArgumentError, 'mail destination not given' if to_addrs.empty?
+      from = if requires_smtputf8(from_addr) && capable?("SMTPUTF8")
+               Address.new(from_addr, "SMTPUTF8")
+             else
+               Address.new(from_addr)
+             end
+      reqlines = [(["MAIL FROM:<#{from.address}>"] + from.parameters).join(' ')]
+      to_addrs.each do |to_addr|
+        addr = Address.new(to_addr)
+        reqlines.push((["RCPT TO:<#{addr.address}>"] + addr.parameters).join(' '))
+      end
+      reqlines.each {|line| validate_line line }
+      # If anything goes wrong while sending the commands or draining
+      # their replies, we cannot confirm resynchronization with the
+      # server, so +critical+ flags the session as broken and the
+      # connection is discarded instead of reused.
+      responses = critical {
+        reqlines.each {|line| @socket.writeline line }
+        reqlines.size.times.map { recv_response() }
+      }
+      unless responses.is_a?(Array)
+        # @error_occurred was already set: the session is unusable.
+        raise IOError, 'SMTP session is in a broken state'
+      end
+      # Every reply for the commands we sent has been consumed at this
+      # point, so the session is back in sync even when the server
+      # rejected the MAIL command.
+      check_response responses[0]
+      results = to_addrs.zip(responses[1..])
+      [results, results.any? {|_, res| res.success? }]
     end
 
     def recv_response
