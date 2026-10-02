@@ -237,11 +237,15 @@ module Net
     # <tt>tls_verify: true</tt> is equivalent to <tt>ssl_context_params: {
     # verify_mode: OpenSSL::SSL::VERIFY_PEER }</tt>.
     #
+    # +dane_policy+ is an optional Net::SMTP::DANE::Policy (or compatible
+    # object) containing the DNSSEC authentication status, TLSA RRset, and
+    # reference domain to use during STARTTLS.
+    #
     # This method does not open the TCP connection.  You can use
     # SMTP.start instead of SMTP.new if you want to do everything
     # at once.  Otherwise, follow SMTP.new with SMTP#start.
     #
-    def initialize(address, port = nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil)
+    def initialize(address, port = nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil, dane_policy: nil)
       @address = address
       @port = (port || SMTP.default_port)
       @esmtp = true
@@ -259,6 +263,7 @@ module Net
       @tls_verify = tls_verify
       @tls_hostname = tls_hostname
       @ssl_context_params = ssl_context_params
+      self.dane_policy = dane_policy if dane_policy
     end
 
     # If +true+, verify th server's certificate.
@@ -269,6 +274,30 @@ module Net
 
     # Hash for additional SSLContext parameters.
     attr_accessor :ssl_context_params
+
+    # Optional DANE policy used to authenticate the STARTTLS certificate.
+    def dane_policy
+      @dane_policy
+    end
+
+    def dane_policy=(policy)
+      if policy.nil?
+        @dane_policy = nil
+      else
+        raise 'openssl library not installed' unless defined?(OpenSSL::VERSION)
+        raise ArgumentError, "DANE is only supported with STARTTLS" if @tls
+        raise ArgumentError, "DANE requires STARTTLS" if @starttls == false
+        unless policy.respond_to?(:dane?) && policy.respond_to?(:verify) &&
+               policy.respond_to?(:reference_domain)
+          raise ArgumentError, "DANE policy must respond to #dane?, #verify, and #reference_domain"
+        end
+        if policy.reference_domain.nil? || policy.reference_domain.to_s.empty?
+          raise ArgumentError, "DANE reference_domain is required"
+        end
+        @dane_policy = policy
+        @starttls = :always
+      end
+    end
 
     # Provide human-readable stringification of class state.
     def inspect
@@ -349,6 +378,7 @@ module Net
     def enable_tls(context = nil)
       raise 'openssl library not installed' unless defined?(OpenSSL::VERSION)
       raise ArgumentError, "SMTPS and STARTTLS is exclusive" if @starttls == :always
+      raise ArgumentError, "SMTPS and DANE STARTTLS is exclusive" if @dane_policy
       @tls = true
       @ssl_context_tls = context
     end
@@ -395,6 +425,7 @@ module Net
     def enable_starttls_auto(context = nil)
       raise 'openssl library not installed' unless defined?(OpenSSL::VERSION)
       raise ArgumentError, "SMTPS and STARTTLS is exclusive" if @tls
+      raise ArgumentError, "DANE requires STARTTLS, not opportunistic STARTTLS" if @dane_policy
       @starttls = :auto
       @ssl_context_starttls = context
     end
@@ -402,6 +433,7 @@ module Net
     # Disables SMTP/TLS (STARTTLS) for this object.  Must be called
     # before the connection is established to have any effect.
     def disable_starttls
+      raise ArgumentError, "cannot disable STARTTLS while a DANE policy is configured" if @dane_policy
       @starttls = false
       @ssl_context_starttls = nil
     end
@@ -455,7 +487,7 @@ module Net
 
     #
     # :call-seq:
-    #  start(address, port = nil, helo: 'localhost', user: nil, secret: nil, authtype: nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil) { |smtp| ... }
+    #  start(address, port = nil, helo: 'localhost', user: nil, secret: nil, authtype: nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil, dane_policy: nil) { |smtp| ... }
     #  start(address, port = nil, helo = 'localhost', user = nil, secret = nil, authtype = nil) { |smtp| ... }
     #
     # Creates a new Net::SMTP object and connects to the server.
@@ -505,6 +537,10 @@ module Net
     # <tt>tls_verify: true</tt> is equivalent to <tt>ssl_context_params: {
     # verify_mode: OpenSSL::SSL::VERIFY_PEER }</tt>.
     #
+    # +dane_policy+ is an optional Net::SMTP::DANE::Policy (or compatible
+    # object) containing the DNSSEC authentication status, TLSA RRset, and
+    # reference domain to use during STARTTLS.
+    #
     # The remaining arguments are used for \SMTP authentication, if required or
     # desired.
     #
@@ -535,14 +571,14 @@ module Net
     def SMTP.start(address, port = nil, *args, helo: nil,
                    user: nil, secret: nil, password: nil, authtype: nil,
                    tls: false, starttls: :auto,
-                   tls_verify: true, tls_hostname: nil, ssl_context_params: nil,
+                   tls_verify: true, tls_hostname: nil, ssl_context_params: nil, dane_policy: nil,
                    &block)
       raise ArgumentError, "wrong number of arguments (given #{args.size + 2}, expected 1..6)" if args.size > 4
       helo ||= args[0] || 'localhost'
       user ||= args[1]
       secret ||= password || args[2]
       authtype ||= args[3]
-      new(address, port, tls: tls, starttls: starttls, tls_verify: tls_verify, tls_hostname: tls_hostname, ssl_context_params: ssl_context_params).start(helo: helo, user: user, secret: secret, authtype: authtype, &block)
+      new(address, port, tls: tls, starttls: starttls, tls_verify: tls_verify, tls_hostname: tls_hostname, ssl_context_params: ssl_context_params, dane_policy: dane_policy).start(helo: helo, user: user, secret: secret, authtype: authtype, &block)
     end
 
     # +true+ if the \SMTP session has been started.
@@ -632,6 +668,7 @@ module Net
         if @starttls && @ssl_context_starttls.nil?
           @ssl_context_starttls = SMTP.default_ssl_context(ssl_context_params)
         end
+        configure_dane_ssl_context if @dane_policy
       end
       if block_given?
         begin
@@ -674,10 +711,24 @@ module Net
       do_helo helo_domain
       if ! tls? and (starttls_always? or (capable_starttls? and starttls_auto?))
         unless capable_starttls?
-          raise SMTPUnsupportedCommand, "STARTTLS is not supported on this server"
+          if @dane_policy
+            raise DANE::CapabilityError,
+                  "DANE STARTTLS capability negotiation failed: server did not advertise STARTTLS"
+          else
+            raise SMTPUnsupportedCommand, "STARTTLS is not supported on this server"
+          end
         end
-        starttls
-        @socket = new_internet_message_io(tlsconnect(s, @ssl_context_starttls))
+        if @dane_policy
+          begin
+            starttls
+          rescue SMTPError => error
+            raise DANE::CapabilityError,
+                  "DANE STARTTLS capability negotiation failed: #{error.message}"
+          end
+        else
+          starttls
+        end
+        @socket = new_internet_message_io(tlsconnect(s, @ssl_context_starttls, @dane_policy))
         # helo response may be different after STARTTLS
         do_helo helo_domain
       end
@@ -695,17 +746,36 @@ module Net
       OpenSSL::SSL::SSLSocket.new socket, context
     end
 
-    def tlsconnect(s, context)
+    def tlsconnect(s, context, dane_policy = nil)
       verified = false
       s = ssl_socket(s, context)
       logging "TLS connection started"
       s.sync_close = true
-      s.hostname = @tls_hostname || @address
+      s.hostname = dane_policy&.reference_domain || @tls_hostname || @address
       ssl_socket_connect(s, @open_timeout)
+      if dane_policy&.dane?
+        dane_policy.verify(s.peer_cert_chain || [s.peer_cert].compact, context)
+      end
       verified = true
       s
     ensure
       s.close unless verified
+    end
+
+    def configure_dane_ssl_context
+      context = @ssl_context_starttls
+      context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+      context.verify_hostname = false
+
+      if @dane_policy.dane?
+        previous_callback = context.verify_callback
+        context.verify_callback = proc do |preverify_ok, store_context|
+          previous_callback&.call(preverify_ok, store_context)
+          true
+        end
+      else
+        context.verify_hostname = true
+      end
     end
 
     def new_internet_message_io(s)
@@ -1152,6 +1222,7 @@ module Net
     end
   end   # class SMTP
 
+  require_relative 'smtp/dane' if defined?(OpenSSL::VERSION)
   SMTPSession = SMTP # :nodoc:
 end
 
