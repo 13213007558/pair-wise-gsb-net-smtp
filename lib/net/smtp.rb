@@ -71,6 +71,30 @@ module Net
     include SMTPError
   end
 
+  # Base class for DANE verification errors.
+  class SMTPDANEError < ProtocolError
+  end
+
+  # The server did not negotiate a DANE-required TLS capability.
+  class SMTPDANECapabilityError < SMTPUnsupportedCommand
+  end
+
+  # A TLSA record did not match the presented certificate.
+  class SMTPDANECertificateAssociationError < SMTPDANEError
+  end
+
+  # A TLSA RRset contains no records with supported parameters.
+  class SMTPDANEUnsupportedTLSAError < SMTPDANECertificateAssociationError
+  end
+
+  # A certificate chain could not be validated for the selected DANE policy.
+  class SMTPDANETrustPathError < SMTPDANEError
+  end
+
+  # DNSSEC authentication state was insufficient or invalid for DANE.
+  class SMTPDANEDNSAuthenticationError < SMTPDANEError
+  end
+
   #
   # == What is This Library?
   #
@@ -237,11 +261,18 @@ module Net
     # <tt>tls_verify: true</tt> is equivalent to <tt>ssl_context_params: {
     # verify_mode: OpenSSL::SSL::VERIFY_PEER }</tt>.
     #
+    # Pass +dane+ with a DANE policy to verify STARTTLS with a
+    # DNSSEC-authenticated TLSA RRset. A secure empty RRset uses ordinary
+    # PKIX verification; insecure TLSA records are never used as trust anchors.
+    # DANE failure raises a Net::SMTPDANEError instead of downgrading.
+    #
     # This method does not open the TCP connection.  You can use
     # SMTP.start instead of SMTP.new if you want to do everything
     # at once.  Otherwise, follow SMTP.new with SMTP#start.
     #
-    def initialize(address, port = nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil)
+    def initialize(address, port = nil, tls: false, starttls: :auto,
+                   tls_verify: true, tls_hostname: nil,
+                   ssl_context_params: nil, dane: nil, dane_policy: nil)
       @address = address
       @port = (port || SMTP.default_port)
       @esmtp = true
@@ -259,6 +290,8 @@ module Net
       @tls_verify = tls_verify
       @tls_hostname = tls_hostname
       @ssl_context_params = ssl_context_params
+      @dane = dane || dane_policy
+      raise ArgumentError, "DANE is only supported with STARTTLS" if @dane && (@tls || @starttls == false)
     end
 
     # If +true+, verify th server's certificate.
@@ -269,6 +302,17 @@ module Net
 
     # Hash for additional SSLContext parameters.
     attr_accessor :ssl_context_params
+
+    # DANE policy used after STARTTLS certificate negotiation.
+    attr_reader :dane
+
+    def dane=(policy)
+      raise ArgumentError, "DANE is only supported with STARTTLS" if policy && (@tls || @starttls == false)
+      @dane = policy
+    end
+
+    alias_method :dane_policy, :dane
+    alias_method :dane_policy=, :dane=
 
     # Provide human-readable stringification of class state.
     def inspect
@@ -349,6 +393,7 @@ module Net
     def enable_tls(context = nil)
       raise 'openssl library not installed' unless defined?(OpenSSL::VERSION)
       raise ArgumentError, "SMTPS and STARTTLS is exclusive" if @starttls == :always
+      raise ArgumentError, "DANE is only supported with STARTTLS" if @dane
       @tls = true
       @ssl_context_tls = context
     end
@@ -402,6 +447,7 @@ module Net
     # Disables SMTP/TLS (STARTTLS) for this object.  Must be called
     # before the connection is established to have any effect.
     def disable_starttls
+      raise ArgumentError, "DANE is only supported with STARTTLS" if @dane
       @starttls = false
       @ssl_context_starttls = nil
     end
@@ -455,7 +501,7 @@ module Net
 
     #
     # :call-seq:
-    #  start(address, port = nil, helo: 'localhost', user: nil, secret: nil, authtype: nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil) { |smtp| ... }
+    #  start(address, port = nil, helo: 'localhost', user: nil, secret: nil, authtype: nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil, dane: nil) { |smtp| ... }
     #  start(address, port = nil, helo = 'localhost', user = nil, secret = nil, authtype = nil) { |smtp| ... }
     #
     # Creates a new Net::SMTP object and connects to the server.
@@ -536,13 +582,17 @@ module Net
                    user: nil, secret: nil, password: nil, authtype: nil,
                    tls: false, starttls: :auto,
                    tls_verify: true, tls_hostname: nil, ssl_context_params: nil,
+                   dane: nil,
                    &block)
       raise ArgumentError, "wrong number of arguments (given #{args.size + 2}, expected 1..6)" if args.size > 4
       helo ||= args[0] || 'localhost'
       user ||= args[1]
       secret ||= password || args[2]
       authtype ||= args[3]
-      new(address, port, tls: tls, starttls: starttls, tls_verify: tls_verify, tls_hostname: tls_hostname, ssl_context_params: ssl_context_params).start(helo: helo, user: user, secret: secret, authtype: authtype, &block)
+      new(address, port, tls: tls, starttls: starttls, tls_verify: tls_verify,
+          tls_hostname: tls_hostname, ssl_context_params: ssl_context_params,
+          dane: dane).start(helo: helo, user: user, secret: secret,
+                            authtype: authtype, &block)
     end
 
     # +true+ if the \SMTP session has been started.
@@ -622,6 +672,15 @@ module Net
       secret ||= password || args[2]
       authtype ||= args[3]
       if defined?(OpenSSL::VERSION)
+        if @dane
+          if @tls || @starttls == false
+            @dane = nil
+            raise ArgumentError, "DANE is only supported with STARTTLS"
+          end
+          unless @dane.respond_to?(:verify) || @dane.respond_to?(:call)
+            raise ArgumentError, "DANE policy must respond to #verify or #call"
+          end
+        end
         ssl_context_params = @ssl_context_params&.dup || {}
         unless ssl_context_params.has_key?(:verify_mode)
           ssl_context_params[:verify_mode] = @tls_verify ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
@@ -632,6 +691,10 @@ module Net
         if @starttls && @ssl_context_starttls.nil?
           @ssl_context_starttls = SMTP.default_ssl_context(ssl_context_params)
         end
+      end
+      if @dane
+        @ssl_context_starttls ||= SMTP.default_ssl_context(ssl_context_params)
+        @ssl_context_starttls.verify_mode = OpenSSL::SSL::VERIFY_NONE
       end
       if block_given?
         begin
@@ -674,12 +737,24 @@ module Net
       do_helo helo_domain
       if ! tls? and (starttls_always? or (capable_starttls? and starttls_auto?))
         unless capable_starttls?
+          if @dane
+            raise SMTPDANECapabilityError, "DANE requires STARTTLS capability, but the server did not advertise it"
+          end
           raise SMTPUnsupportedCommand, "STARTTLS is not supported on this server"
         end
-        starttls
+        @dane.before_starttls if @dane.respond_to?(:before_starttls)
+        begin
+          starttls
+        rescue SMTPError
+          raise if !@dane
+          message = "DANE requires STARTTLS capability, but the server refused STARTTLS: #{$!.message}"
+          raise SMTPDANECapabilityError, message
+        end
         @socket = new_internet_message_io(tlsconnect(s, @ssl_context_starttls))
         # helo response may be different after STARTTLS
         do_helo helo_domain
+      elsif @dane && !capable_starttls?
+        raise SMTPDANECapabilityError, "DANE requires STARTTLS capability, but the server did not advertise it"
       end
       authenticate user, secret, (authtype || DEFAULT_AUTH_TYPE) if user
       @started = true
@@ -700,12 +775,27 @@ module Net
       s = ssl_socket(s, context)
       logging "TLS connection started"
       s.sync_close = true
-      s.hostname = @tls_hostname || @address
+      s.hostname = dane_hostname || @tls_hostname || @address
       ssl_socket_connect(s, @open_timeout)
+      verify_dane(s)
       verified = true
       s
     ensure
       s.close unless verified
+    end
+
+    def dane_hostname
+      return nil unless @dane
+      @dane.hostname if @dane.respond_to?(:hostname)
+    end
+
+    def verify_dane(socket)
+      return unless @dane
+      if @dane.respond_to?(:verify)
+        @dane.verify(socket)
+      else
+        @dane.call(socket)
+      end
     end
 
     def new_internet_message_io(s)
@@ -1159,3 +1249,4 @@ require_relative 'smtp/authenticator'
 Dir.glob("#{__dir__}/smtp/auth_*.rb") do |r|
   require_relative r
 end
+require_relative 'smtp/dane'

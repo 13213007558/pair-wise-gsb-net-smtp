@@ -1,5 +1,11 @@
 # NEWS
 
+## Unreleased
+
+### Improvements
+
+* Add an optional DANE policy interface for STARTTLS TLSA verification (RFC 7671, RFC 7672).
+
 ## Version 0.5.0 (2024-03-27)
 
 ### Improvements
