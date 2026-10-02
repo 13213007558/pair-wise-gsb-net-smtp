@@ -293,6 +293,12 @@ module Net
       capable?('STARTTLS')
     end
 
+    # true if server advertises PIPELINING.
+    # You cannot get valid value before opening SMTP session.
+    def capable_pipelining?
+      capable?('PIPELINING')
+    end
+
     # true if the EHLO response contains +key+.
     def capable?(key)
       return nil unless @capabilities
@@ -800,6 +806,71 @@ module Net
     alias sendmail send_message   # obsolete
 
     #
+    # Sends +msgstr+ as a message, explicitly using the PIPELINING
+    # extension [RFC2920[https://www.rfc-editor.org/rfc/rfc2920.txt]]
+    # when the server advertises it.
+    #
+    # Unlike #send_message, the envelope commands (MAIL FROM and all
+    # RCPT TO) are sent in one batch without waiting for each reply,
+    # saving one network round trip per recipient.  The DATA command
+    # and the message body are still sent only after the server has
+    # accepted the envelope and granted permission with a 354 reply,
+    # so +msgstr+ is never read before that point.
+    #
+    # If the server does not advertise PIPELINING, the envelope is sent
+    # with the original serial behavior (one round trip per command).
+    #
+    # The return value is a Hash mapping each recipient address (String)
+    # to the Net::SMTP::Response the server returned for it, so the
+    # caller can see exactly which recipients were accepted or rejected.
+    #
+    # If the MAIL FROM command is rejected, or if _every_ recipient is
+    # rejected, the replies for all commands already sent are consumed
+    # (keeping the session in sync) and then the corresponding error is
+    # raised.  If the connection itself fails mid-flight and the session
+    # cannot be resynchronized, the connection is discarded.
+    #
+    # === Example
+    #
+    #     Net::SMTP.start('smtp.example.com') do |smtp|
+    #       results = smtp.send_message_pipelined msgstr,
+    #                         'from@example.com',
+    #                         ['dest@example.com', 'dest2@example.com']
+    #       results.each do |addr, res|
+    #         puts "#{addr}: #{res.status} #{res.message}" unless res.success?
+    #       end
+    #     end
+    #
+    # === Errors
+    #
+    # This method may raise:
+    #
+    # * Net::SMTPServerBusy
+    # * Net::SMTPSyntaxError
+    # * Net::SMTPFatalError
+    # * Net::SMTPUnknownError
+    # * Net::ReadTimeout
+    # * IOError
+    #
+    def send_message_pipelined(msgstr, from_addr, *to_addrs)
+      to_addrs.flatten!
+      raise IOError, 'closed session' unless @socket
+      raise ArgumentError, 'mail destination not given' if to_addrs.empty?
+      from_addr = Address.new(from_addr, 'SMTPUTF8') if any_require_smtputf8(to_addrs) && capable?('SMTPUTF8')
+      results = if capable_pipelining?
+                  pipelined_envelope(from_addr, to_addrs)
+                else
+                  serial_envelope(from_addr, to_addrs)
+                end
+      if results.none? { |_, res| res.success? }
+        res = results.values.first
+        raise res.exception_class.new(res)
+      end
+      data msgstr
+      results
+    end
+
+    #
     # Opens a message writer stream and gives it to the block.
     # The stream is valid only in the block, and has these methods:
     #
@@ -907,12 +978,7 @@ module Net
 
     # +from_addr+ is +String+ or +Net::SMTP::Address+
     def mailfrom(from_addr)
-      addr = if requires_smtputf8(from_addr) && capable?("SMTPUTF8")
-               Address.new(from_addr, "SMTPUTF8")
-             else
-               Address.new(from_addr)
-             end
-      getok((["MAIL FROM:<#{addr.address}>"] + addr.parameters).join(' '))
+      getok(mail_command(from_addr))
     end
 
     def rcptto_list(to_addrs)
@@ -925,8 +991,7 @@ module Net
 
     # +to_addr+ is +String+ or +Net::SMTP::Address+
     def rcptto(to_addr)
-      addr = Address.new(to_addr)
-      getok((["RCPT TO:<#{addr.address}>"] + addr.parameters).join(' '))
+      getok(rcpt_command(to_addr))
     end
 
     # This method sends a message.
@@ -990,6 +1055,57 @@ module Net
     end
 
     private
+
+    def mail_command(from_addr)
+      addr = if requires_smtputf8(from_addr) && capable?("SMTPUTF8")
+               Address.new(from_addr, "SMTPUTF8")
+             else
+               Address.new(from_addr)
+             end
+      (["MAIL FROM:<#{addr.address}>"] + addr.parameters).join(' ')
+    end
+
+    def rcpt_command(to_addr)
+      addr = Address.new(to_addr)
+      (["RCPT TO:<#{addr.address}>"] + addr.parameters).join(' ')
+    end
+
+    # Sends MAIL FROM and all RCPT TO commands without waiting for the
+    # individual replies, then reads exactly one reply per command sent.
+    # Returns a Hash mapping each recipient address to its Response.
+    # Raises (after every reply has been consumed) if MAIL FROM failed.
+    def pipelined_envelope(from_addr, to_addrs)
+      commands = [mail_command(from_addr)] + to_addrs.map {|addr| rcpt_command(addr) }
+      commands.each {|cmd| validate_line cmd }
+      responses = nil
+      critical {
+        commands.each {|cmd| @socket.writeline cmd }
+        responses = commands.map { recv_response() }
+      }
+      # The session was already in an unrecoverable error state.
+      raise IOError, 'cannot pipeline commands on a broken session' unless responses
+      check_response responses.shift
+      results = {}
+      to_addrs.zip(responses) do |addr, res|
+        results[Address.new(addr).address] = res
+      end
+      results
+    end
+
+    # Serial fallback used when the server does not advertise PIPELINING.
+    def serial_envelope(from_addr, to_addrs)
+      mailfrom from_addr
+      results = {}
+      to_addrs.each do |addr|
+        key = Address.new(addr).address
+        begin
+          results[key] = rcptto(addr)
+        rescue SMTPError => e
+          results[key] = e.response
+        end
+      end
+      results
+    end
 
     def validate_line(line)
       # A bare CR or LF is not allowed in RFC5321.

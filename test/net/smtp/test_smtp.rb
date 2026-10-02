@@ -20,6 +20,7 @@ module Net
 
     def teardown
       FakeServer.stop_all
+      PipeliningServer.stop_all
     end
 
     def test_critical
@@ -625,6 +626,144 @@ module Net
       server.start(**kw)
       server.port
     end
+
+    def test_capable_pipelining
+      server = PipeliningServer.start(pipelining: true)
+      smtp = Net::SMTP.start 'localhost', server.port
+      assert_equal true, smtp.capable_pipelining?
+      smtp.finish
+
+      server = PipeliningServer.start(pipelining: false)
+      smtp = Net::SMTP.start 'localhost', server.port
+      assert_equal false, smtp.capable_pipelining?
+      smtp.finish
+    end
+
+    def test_send_message_pipelined
+      server = PipeliningServer.start(pipelining: true)
+      smtp = Net::SMTP.start 'localhost', server.port
+      results = smtp.send_message_pipelined 'message', 'foo@example.com',
+                                            'a@example.com', 'b@example.com', 'c@example.com'
+      assert_equal %w[a@example.com b@example.com c@example.com], results.keys
+      assert results.values.all?(&:success?)
+      smtp.finish
+
+      envelope = server.commands.grep(/\A(?:MAIL FROM:|RCPT TO:)/)
+      assert_equal 4, envelope.size
+      assert_equal "MAIL FROM:<foo@example.com>\r\n", envelope.first
+      # the whole envelope was sent before the first reply was needed
+      assert_operator server.max_in_flight, :>=, 4
+      # every command sent got exactly its replies consumed (DATA has two)
+      assert_equal server.commands.size + 1, server.replies.size
+      assert_include server.body, "message\r\n"
+    end
+
+    def test_send_message_pipelined_mail_failure
+      server = PipeliningServer.start(pipelining: true,
+                                      mail_reply: "550 5.7.1 Sender rejected\r\n")
+      smtp = Net::SMTP.start 'localhost', server.port
+      ex = assert_raise(Net::SMTPFatalError) do
+        smtp.send_message_pipelined 'message', 'foo@example.com',
+                                    'a@example.com', 'b@example.com'
+      end
+      assert_equal '550', ex.response.status
+      # the pipelined RCPT TO replies were consumed before raising,
+      # so the session is still in sync and usable
+      assert smtp.rset.success?
+      smtp.finish
+
+      assert_equal 3, server.commands.grep(/\A(?:MAIL FROM:|RCPT TO:)/).size
+      assert_equal 0, server.commands.grep(/\ADATA/).size
+      assert_equal server.commands.size, server.replies.size
+    end
+
+    def test_send_message_pipelined_partial_rcpt_rejected
+      server = PipeliningServer.start(pipelining: true,
+                                      rcpt_replies: {'bad@example.com' => "550 5.1.1 No such user\r\n"})
+      smtp = Net::SMTP.start 'localhost', server.port
+      results = smtp.send_message_pipelined 'message', 'foo@example.com',
+                                            'good@example.com', 'bad@example.com'
+      smtp.finish
+
+      assert results['good@example.com'].success?
+      assert_false results['bad@example.com'].success?
+      assert_equal '550', results['bad@example.com'].status
+      assert_include server.body, "message\r\n"
+    end
+
+    def test_send_message_pipelined_all_rcpt_rejected
+      server = PipeliningServer.start(pipelining: true,
+                                      rcpt_replies: Hash.new("550 5.1.1 No such user\r\n"))
+      smtp = Net::SMTP.start 'localhost', server.port
+      ex = assert_raise(Net::SMTPFatalError) do
+        smtp.send_message_pipelined 'message', 'foo@example.com',
+                                    'a@example.com', 'b@example.com'
+      end
+      assert_equal '550', ex.response.status
+      # all replies were drained; the session is still usable
+      assert smtp.rset.success?
+      smtp.finish
+
+      assert_equal 0, server.commands.grep(/\ADATA/).size
+      assert_equal server.commands.size, server.replies.size
+    end
+
+    def test_send_message_pipelined_delayed_and_fragmented_replies
+      server = PipeliningServer.start(pipelining: true,
+                                      reply_delay: 0.05, fragment_replies: true)
+      smtp = Net::SMTP.start 'localhost', server.port
+      smtp.read_timeout = 5
+      results = smtp.send_message_pipelined 'message', 'foo@example.com',
+                                            'a@example.com', 'b@example.com'
+      smtp.finish
+
+      assert_equal %w[a@example.com b@example.com], results.keys
+      assert results.values.all?(&:success?)
+      assert_include server.body, "message\r\n"
+    end
+
+    def test_send_message_pipelined_without_capability
+      server = PipeliningServer.start(pipelining: false,
+                                      rcpt_replies: {'bad@example.com' => "550 5.1.1 No such user\r\n"})
+      smtp = Net::SMTP.start 'localhost', server.port
+      results = smtp.send_message_pipelined 'message', 'foo@example.com',
+                                            'good@example.com', 'bad@example.com'
+      smtp.finish
+
+      # serial fallback: never more than one unanswered command in flight
+      assert_equal 1, server.max_in_flight
+      assert results['good@example.com'].success?
+      assert_equal '550', results['bad@example.com'].status
+      assert_include server.body, "message\r\n"
+    end
+
+    def test_send_message_pipelined_data_waits_for_continue
+      events = []
+      server = PipeliningServer.start(pipelining: true, events: events)
+      smtp = Net::SMTP.start 'localhost', server.port
+      msg = OneShotMessage.new(events)
+      results = smtp.send_message_pipelined msg, 'foo@example.com', 'a@example.com'
+      smtp.finish
+
+      assert results['a@example.com'].success?
+      # the one-shot message source was read only after the server
+      # allowed the DATA phase with a 354 reply
+      assert_operator events.index(:message_read), :>, events.index(:sent_354)
+      assert_include server.body, "one-shot body\r\n"
+    end
+
+    def test_send_message_pipelined_connection_drop
+      server = PipeliningServer.start(pipelining: true, close_on: /\AMAIL FROM:/)
+      smtp = Net::SMTP.start 'localhost', server.port
+      smtp.read_timeout = 5
+      assert_raise(EOFError, SystemCallError, IOError) do
+        smtp.send_message_pipelined 'message', 'foo@example.com', 'a@example.com'
+      end
+      # the connection cannot be resynchronized and is discarded:
+      # finish must not send further commands nor raise
+      smtp.finish
+      assert_false smtp.started?
+    end
   end
 
   class FakeServer
@@ -817,6 +956,169 @@ module Net
       end
     rescue Errno::ECONNRESET, Errno::ECONNABORTED
       nil
+    end
+  end
+
+  # A message source that can be read only once, used to verify that
+  # the message body is not consumed before the server allows DATA.
+  class OneShotMessage
+    def initialize(events)
+      @events = events
+      @used = false
+    end
+
+    def each(&block)
+      raise 'one-shot message source consumed twice' if @used
+      @used = true
+      @events << :message_read
+      return enum_for(:each) unless block
+      "Subject: one-shot\r\n\r\none-shot body\r\n".each_line(&block)
+    end
+  end
+
+  # A scriptable SMTP test server.  It records every command received
+  # and every reply sent, tracks the maximum number of commands received
+  # but not yet replied to (to detect pipelining), and can delay or
+  # fragment its replies or drop the connection on a chosen command.
+  class PipeliningServer
+    @servers = []
+
+    def self.start(**kw)
+      server = new(**kw)
+      @servers.push server
+      server.start
+      server
+    end
+
+    def self.stop_all
+      while (s = @servers.shift)
+        s.stop
+      end
+    end
+
+    attr_reader :port, :commands, :replies, :body, :max_in_flight
+
+    def initialize(pipelining: true, mail_reply: "250 2.1.0 Ok\r\n",
+                   rcpt_replies: {}, reply_delay: 0, fragment_replies: false,
+                   close_on: nil, settle: 0.05, events: nil)
+      @pipelining = pipelining
+      @mail_reply = mail_reply
+      @rcpt_replies = rcpt_replies
+      @reply_delay = reply_delay
+      @fragment_replies = fragment_replies
+      @close_on = close_on
+      @settle = settle
+      @events = events
+      @commands = []
+      @replies = []
+      @body = +''
+      @max_in_flight = 0
+    end
+
+    def start
+      @server = TCPServer.new('localhost', 0)
+      @port = @server.addr[1]
+      @thread = Thread.start do
+        Thread.current.abort_on_exception = true
+        run
+      end
+      self
+    end
+
+    def stop
+      @thread&.kill
+      @thread&.join
+      @server&.close
+    end
+
+    private
+
+    def run
+      sock = @server.accept
+      sock.write "220 ready\r\n"
+      @buf = +''
+      loop do
+        line = next_line(sock, true) or break
+        batch = [line]
+        # give pipelined commands a chance to arrive, then drain whatever
+        # is already buffered to measure how many commands are in flight
+        sleep @settle
+        while (l = next_line(sock, false))
+          batch << l
+        end
+        @max_in_flight = batch.size if batch.size > @max_in_flight
+        batch.each do |cmd|
+          return unless handle_command(sock, cmd)
+        end
+      end
+    rescue Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE, IOError
+      nil
+    ensure
+      sock&.close rescue nil
+    end
+
+    def next_line(sock, block)
+      until (i = @buf.index("\n"))
+        begin
+          @buf << (block ? sock.readpartial(4096) : sock.read_nonblock(4096))
+        rescue IO::WaitReadable, EOFError
+          return nil
+        end
+      end
+      @buf.slice!(0..i)
+    end
+
+    def handle_command(sock, cmd)
+      @commands << cmd
+      if @close_on && cmd.match?(@close_on)
+        sock.close
+        return false
+      end
+      case cmd
+      when /\AEHLO /
+        reply sock, ehlo_reply
+      when /\AMAIL FROM:/
+        reply sock, @mail_reply
+      when /\ARCPT TO:<([^>]+)>/
+        reply sock, @rcpt_replies.fetch($1) { @rcpt_replies.default || "250 2.1.5 Ok\r\n" }
+      when /\ADATA/
+        @events&.push(:data_received)
+        reply sock, "354 End data with <CR><LF>.<CR><LF>\r\n"
+        @events&.push(:sent_354)
+        while (l = next_line(sock, true))
+          break if l.chomp == '.'
+          @body << l
+        end
+        reply sock, "250 2.0.0 Ok: queued\r\n"
+      when /\ARSET/
+        reply sock, "250 2.0.0 Ok\r\n"
+      when /\AQUIT/
+        reply sock, "221 2.0.0 Bye\r\n"
+        return false
+      else
+        reply sock, "502 5.5.2 Error: command not recognized\r\n"
+      end
+      true
+    end
+
+    def reply(sock, text)
+      sleep @reply_delay if @reply_delay > 0
+      if @fragment_replies
+        text.each_char do |ch|
+          sock.write ch
+          sock.flush
+        end
+      else
+        sock.write text
+      end
+      @replies << text
+    end
+
+    def ehlo_reply
+      lines = ["250-servername\r\n"]
+      lines << "250-PIPELINING\r\n" if @pipelining
+      lines << "250 HELP\r\n"
+      lines.join
     end
   end
 end

@@ -1,5 +1,16 @@
 # NEWS
 
+## Unreleased
+
+### Improvements
+
+* Add Net::SMTP#send_message_pipelined, an explicitly opt-in message sending
+  entry point that pipelines the envelope commands (MAIL FROM and RCPT TO)
+  when the server advertises PIPELINING (RFC 2920) and returns a Hash of
+  per-recipient Net::SMTP::Response results.  Servers without the PIPELINING
+  capability are handled with the original serial behavior.
+* Add Net::SMTP#capable_pipelining? to check for the PIPELINING capability.
+
 ## Version 0.5.0 (2024-03-27)
 
 ### Improvements
