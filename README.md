@@ -62,6 +62,28 @@ Net::SMTP.start('your.smtp.server', 25) do |smtp|
 end
 ```
 
+### Pipelining Envelope Commands
+
+When the server advertises `PIPELINING`, set `pipelining: true` to send
+`MAIL FROM`, all `RCPT TO`, and `DATA` without waiting between writes.
+Responses are still read in command order. The returned
+`Net::SMTP::EnvelopeResponse` contains the response for each recipient:
+
+```ruby
+Net::SMTP.start('your.smtp.server', pipelining: true) do |smtp|
+  result = smtp.send_message(msgstr,
+                             'your@mail.address',
+                             ['one@example.com', 'two@example.com'])
+  result.rejected_recipients.each do |recipient|
+    warn "#{recipient.address}: #{recipient.status}"
+  end
+end
+```
+
+The message body is sent only when at least one recipient is accepted and the
+server returns `354` to `DATA`. When pipelining is unavailable, the normal
+one-command-at-a-time behavior is used.
+
 ### Closing the Session
 
 You MUST close the SMTP session after sending messages, by calling
