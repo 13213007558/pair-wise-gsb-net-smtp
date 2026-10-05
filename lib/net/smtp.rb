@@ -29,6 +29,7 @@ module Net
     # In later release, this module becomes a class.
 
     attr_reader :response
+    attr_accessor :envelope
 
     def initialize(response, message: nil)
       if response.is_a?(::Net::SMTP::Response)
@@ -230,6 +231,9 @@ module Net
     # If the hostname in the server certificate is different from +address+,
     # it can be specified with +tls_hostname+.
     #
+    # If +pipelining+ is true, #send_message and #open_message_stream batch
+    # envelope commands when the connected server advertises PIPELINING.
+    #
     # Additional SSLContext[https://ruby.github.io/openssl/OpenSSL/SSL/SSLContext.html]
     # params can be added to the +ssl_context_params+ hash argument and are
     # passed to {OpenSSL::SSL::SSLContext#set_params}[https://ruby.github.io/openssl/OpenSSL/SSL/SSLContext.html#method-i-set_params].
@@ -241,7 +245,7 @@ module Net
     # SMTP.start instead of SMTP.new if you want to do everything
     # at once.  Otherwise, follow SMTP.new with SMTP#start.
     #
-    def initialize(address, port = nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil)
+    def initialize(address, port = nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil, pipelining: false)
       @address = address
       @port = (port || SMTP.default_port)
       @esmtp = true
@@ -251,6 +255,7 @@ module Net
       @open_timeout = 30
       @read_timeout = 60
       @error_occurred = false
+      @pipelining = pipelining
       @debug_output = nil
       @tls = tls
       @starttls = starttls
@@ -284,6 +289,16 @@ module Net
     #
     attr_accessor :esmtp
 
+    # Set whether to pipeline MAIL, RCPT, and DATA when the server advertises
+    # PIPELINING. This should be set before calling #start or supplied to
+    # SMTP.start/#start.
+    attr_accessor :pipelining
+
+    # +true+ if envelope command pipelining is enabled.
+    def pipelining?
+      !!@pipelining
+    end
+
     # +true+ if the SMTP object uses ESMTP (which it does by default).
     alias esmtp? esmtp
 
@@ -297,6 +312,12 @@ module Net
     def capable?(key)
       return nil unless @capabilities
       @capabilities[key] ? true : false
+    end
+
+    # true if server advertises PIPELINING.
+    # You cannot get valid value before opening SMTP session.
+    def capable_pipelining?
+      capable?('PIPELINING')
     end
 
     # The server capabilities by EHLO response
@@ -455,7 +476,7 @@ module Net
 
     #
     # :call-seq:
-    #  start(address, port = nil, helo: 'localhost', user: nil, secret: nil, authtype: nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil) { |smtp| ... }
+    #  start(address, port = nil, helo: 'localhost', user: nil, secret: nil, authtype: nil, tls: false, starttls: :auto, tls_verify: true, tls_hostname: nil, ssl_context_params: nil, pipelining: false) { |smtp| ... }
     #  start(address, port = nil, helo = 'localhost', user = nil, secret = nil, authtype = nil) { |smtp| ... }
     #
     # Creates a new Net::SMTP object and connects to the server.
@@ -514,6 +535,10 @@ module Net
     #
     # +secret+ or +password+ is your password or other authentication token.
     #
+    # Set +pipelining+ to true to enable envelope command pipelining for
+    # messages sent on sessions created by this method. It is used only when
+    # the server advertises the PIPELINING extension.
+    #
     # These will be sent to #authenticate as positional arguments-the exact
     # semantics are dependent on the +authtype+.
     #
@@ -536,13 +561,14 @@ module Net
                    user: nil, secret: nil, password: nil, authtype: nil,
                    tls: false, starttls: :auto,
                    tls_verify: true, tls_hostname: nil, ssl_context_params: nil,
+                   pipelining: false,
                    &block)
       raise ArgumentError, "wrong number of arguments (given #{args.size + 2}, expected 1..6)" if args.size > 4
       helo ||= args[0] || 'localhost'
       user ||= args[1]
       secret ||= password || args[2]
       authtype ||= args[3]
-      new(address, port, tls: tls, starttls: starttls, tls_verify: tls_verify, tls_hostname: tls_hostname, ssl_context_params: ssl_context_params).start(helo: helo, user: user, secret: secret, authtype: authtype, &block)
+      new(address, port, tls: tls, starttls: starttls, tls_verify: tls_verify, tls_hostname: tls_hostname, ssl_context_params: ssl_context_params, pipelining: pipelining).start(helo: helo, user: user, secret: secret, authtype: authtype, &block)
     end
 
     # +true+ if the \SMTP session has been started.
@@ -552,7 +578,7 @@ module Net
 
     #
     # :call-seq:
-    #  start(helo: 'localhost', user: nil, secret: nil, authtype: nil) { |smtp| ... }
+    #  start(helo: 'localhost', user: nil, secret: nil, authtype: nil, pipelining: false) { |smtp| ... }
     #  start(helo = 'localhost', user = nil, secret = nil, authtype = nil) { |smtp| ... }
     #
     # Opens a TCP connection and starts the SMTP session.
@@ -570,6 +596,10 @@ module Net
     # +user+ is the authentication or authorization identity.
     #
     # +secret+ or +password+ is your password or other authentication token.
+    #
+    # Set +pipelining+ to true to enable envelope command pipelining for
+    # messages sent on this session. It is used only when the server advertises
+    # the PIPELINING extension.
     #
     # These will be sent to #authenticate as positional arguments-the exact
     # semantics are dependent on the +authtype+.
@@ -615,12 +645,13 @@ module Net
     # * Net::ReadTimeout
     # * IOError
     #
-    def start(*args, helo: nil, user: nil, secret: nil, password: nil, authtype: nil)
+    def start(*args, helo: nil, user: nil, secret: nil, password: nil, authtype: nil, pipelining: nil)
       raise ArgumentError, "wrong number of arguments (given #{args.size}, expected 0..4)" if args.size > 4
       helo ||= args[0] || 'localhost'
       user ||= args[1]
       secret ||= password || args[2]
       authtype ||= args[3]
+      @pipelining = pipelining unless pipelining.nil?
       if defined?(OpenSSL::VERSION)
         ssl_context_params = @ssl_context_params&.dup || {}
         unless ssl_context_params.has_key?(:verify_mode)
@@ -763,6 +794,11 @@ module Net
     # +to_addr+ is a String or Net::SMTP::Address or Array of them, representing
     # the destination mail address or addresses.
     #
+    # Set +pipelining+ to true to write MAIL, RCPT, and DATA in one batch when
+    # the server advertises PIPELINING. The returned Hash then contains the
+    # ordered MAIL, RCPT, DATA, and final message responses; failed recipient
+    # responses remain available when at least one recipient is accepted.
+    #
     # === Example
     #
     #     Net::SMTP.start('smtp.example.com') do |smtp|
@@ -788,12 +824,16 @@ module Net
     # * Net::ReadTimeout
     # * IOError
     #
-    def send_message(msgstr, from_addr, *to_addrs)
+    def send_message(msgstr, from_addr, *to_addrs, pipelining: nil)
       to_addrs.flatten!
       raise IOError, 'closed session' unless @socket
       from_addr = Address.new(from_addr, 'SMTPUTF8') if any_require_smtputf8(to_addrs) && capable?('SMTPUTF8')
-      mailfrom from_addr
-      rcptto_list(to_addrs) {data msgstr}
+      if pipelining_enabled?(pipelining)
+        pipelined_envelope(from_addr, to_addrs, msgstr)
+      else
+        mailfrom from_addr
+        rcptto_list(to_addrs) {data msgstr}
+      end
     end
 
     alias send_mail send_message
@@ -820,6 +860,8 @@ module Net
     # +to_addr+ is a String or Net::SMTP::Address or Array of them, representing
     # the destination mail address or addresses.
     #
+    # See #send_message for the +pipelining+ option and response Hash.
+    #
     # === Example
     #
     #     Net::SMTP.start('smtp.example.com', 25) do |smtp|
@@ -843,12 +885,16 @@ module Net
     # * Net::ReadTimeout
     # * IOError
     #
-    def open_message_stream(from_addr, *to_addrs, &block)   # :yield: stream
+    def open_message_stream(from_addr, *to_addrs, pipelining: nil, &block)   # :yield: stream
       to_addrs.flatten!
       raise IOError, 'closed session' unless @socket
       from_addr = Address.new(from_addr, 'SMTPUTF8') if any_require_smtputf8(to_addrs) && capable?('SMTPUTF8')
-      mailfrom from_addr
-      rcptto_list(to_addrs) {data(&block)}
+      if pipelining_enabled?(pipelining)
+        pipelined_envelope(from_addr, to_addrs, &block)
+      else
+        mailfrom from_addr
+        rcptto_list(to_addrs) {data(&block)}
+      end
     end
 
     alias ready open_message_stream   # obsolete
@@ -907,12 +953,7 @@ module Net
 
     # +from_addr+ is +String+ or +Net::SMTP::Address+
     def mailfrom(from_addr)
-      addr = if requires_smtputf8(from_addr) && capable?("SMTPUTF8")
-               Address.new(from_addr, "SMTPUTF8")
-             else
-               Address.new(from_addr)
-             end
-      getok((["MAIL FROM:<#{addr.address}>"] + addr.parameters).join(' '))
+      getok(mail_command(from_addr))
     end
 
     def rcptto_list(to_addrs)
@@ -925,8 +966,7 @@ module Net
 
     # +to_addr+ is +String+ or +Net::SMTP::Address+
     def rcptto(to_addr)
-      addr = Address.new(to_addr)
-      getok((["RCPT TO:<#{addr.address}>"] + addr.parameters).join(' '))
+      getok(rcpt_command(to_addr))
     end
 
     # This method sends a message.
@@ -987,6 +1027,149 @@ module Net
       validate_line reqline
       @socket.writeline reqline
       recv_response()
+    end
+
+    private
+
+    def mail_command(from_addr)
+      addr = if requires_smtputf8(from_addr) && capable?("SMTPUTF8")
+               Address.new(from_addr, "SMTPUTF8")
+             else
+               Address.new(from_addr)
+             end
+      (["MAIL FROM:<#{addr.address}>"] + addr.parameters).join(' ')
+    end
+
+    def rcpt_command(to_addr)
+      addr = Address.new(to_addr)
+      (["RCPT TO:<#{addr.address}>"] + addr.parameters).join(' ')
+    end
+
+    def pipelining_enabled?(requested)
+      requested = @pipelining if requested.nil?
+      !!requested && capable_pipelining?
+    end
+
+    def pipelined_envelope(from_addr, to_addrs, msgstr = nil, &block)
+      raise ArgumentError, 'mail destination not given' if to_addrs.empty?
+      if msgstr and block
+        raise ArgumentError, "message and block are exclusive"
+      end
+      unless msgstr or block
+        raise ArgumentError, "message or block is required"
+      end
+
+      commands = [mail_command(from_addr)] +
+        to_addrs.map { |addr| rcpt_command(addr) } +
+        ['DATA']
+      result = critical do
+        write_pipelined_commands(commands)
+        mail_response = recv_response
+        recipient_results = to_addrs.map do |addr|
+          address = Address.new(addr)
+          response = recv_response
+          { address: address.address, response: response }
+        end
+        data_response = recv_response
+        accepted_recipient = recipient_results.any? { |item| item[:response].success? }
+        message_response = data_response
+
+        if data_response.continue? && mail_response.success? && accepted_recipient
+          socket_sync_bak = @socket.io.sync
+          begin
+            @socket.io.sync = false
+            write_message_payload(msgstr, &block)
+          ensure
+            @socket.io.flush
+            @socket.io.sync = socket_sync_bak
+          end
+          message_response = recv_response
+        elsif data_response.continue?
+          @socket.writeline('.')
+          message_response = recv_response
+        end
+
+        {
+          mail: mail_response,
+          recipients: recipient_results,
+          recipient_responses: recipient_results.map { |item| item[:response] },
+          data: data_response,
+          message: message_response
+        }
+      end
+
+      reset_pipelined_envelope(result) if pipelined_reset_required?(result)
+      raise_pipelined_envelope_error(result)
+      result
+    end
+
+    def write_pipelined_commands(commands)
+      commands.each { |command| validate_line(command) }
+      socket_sync_bak = @socket.io.sync
+      begin
+        @socket.io.sync = false
+        @socket.write(commands.map { |command| command + "\r\n" }.join)
+        @socket.io.flush
+      ensure
+        @socket.io.sync = socket_sync_bak
+      end
+    end
+
+    def write_message_payload(msgstr = nil, &block)
+      if msgstr
+        @socket.write_message msgstr
+      else
+        @socket.write_message_by_block(&block)
+      end
+    end
+
+    def pipelined_reset_required?(result)
+      return false if result[:mail].status == '421' || result[:data].status == '421'
+      return true unless result[:mail].success?
+      return true unless result[:data].continue?
+      return true if result[:recipients].none? { |item| item[:response].success? }
+      false
+    end
+
+    def reset_pipelined_envelope(result)
+      if result[:mail].status == '421' || result[:data].status == '421'
+        @error_occurred = true
+        return
+      end
+
+      @socket.writeline('RSET')
+      response = recv_response
+      @error_occurred = !response.success?
+    rescue IOError, SystemCallError, Net::ReadTimeout
+      @error_occurred = true
+    end
+
+    def raise_pipelined_envelope_error(result)
+      response = failed_pipelined_response(result)
+      return unless response
+
+      if response.equal?(result[:data]) && !response.continue?
+        error = SMTPUnknownError.new(response,
+                                    message: "could not get 3xx (#{response.status}: #{response.string})")
+      else
+        error = response.exception_class.new(response)
+      end
+      error.envelope = result
+      raise error
+    end
+
+    def failed_pipelined_response(result)
+      return result[:mail] unless result[:mail].success?
+
+      accepted = result[:recipients].any? { |item| item[:response].success? }
+      unless accepted
+        failed_recipient = result[:recipients].find { |item| !item[:response].success? }
+        return failed_recipient[:response] if failed_recipient
+      end
+
+      return result[:data] unless result[:data].continue?
+      return result[:message] unless result[:message].success?
+      nil
     end
 
     private

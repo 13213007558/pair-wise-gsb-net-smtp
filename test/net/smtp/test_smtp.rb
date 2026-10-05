@@ -5,6 +5,12 @@ require 'test/unit'
 
 module Net
   class TestSMTP < Test::Unit::TestCase
+    @scripted_servers = []
+
+    class << self
+      attr_reader :scripted_servers
+    end
+
     def setup
       # Avoid hanging at fake_server_start's IO.select on --jit-wait CI like http://ci.rvm.jp/results/trunk-mjit-wait@phosphorus-docker/3302796
       # Unfortunately there's no way to configure read_timeout for Net::SMTP.start.
@@ -20,6 +26,9 @@ module Net
 
     def teardown
       FakeServer.stop_all
+      while (server = self.class.scripted_servers.shift)
+        server.stop
+      end
     end
 
     def test_critical
@@ -70,7 +79,7 @@ module Net
 
     def test_mailfrom
       server = FakeServer.start
-      smtp = Net::SMTP.start 'localhost', server.port
+      smtp = Net::SMTP.start '127.0.0.1', server.port
       assert smtp.mailfrom("foo@example.com").success?
       assert_equal "MAIL FROM:<foo@example.com>\r\n", server.commands.last
       smtp.finish
@@ -78,7 +87,7 @@ module Net
 
     def test_mailfrom_with_address
       server = FakeServer.start
-      smtp = Net::SMTP.start 'localhost', server.port
+      smtp = Net::SMTP.start '127.0.0.1', server.port
       addr = Net::SMTP::Address.new("foo@example.com", size: 12345)
       assert smtp.mailfrom(addr).success?
       assert_equal "MAIL FROM:<foo@example.com> size=12345\r\n", server.commands.last
@@ -86,14 +95,14 @@ module Net
 
     def test_rcptto
       server = FakeServer.start
-      smtp = Net::SMTP.start 'localhost', server.port
+      smtp = Net::SMTP.start '127.0.0.1', server.port
       assert smtp.rcptto("foo@example.com").success?
       assert_equal "RCPT TO:<foo@example.com>\r\n", server.commands.last
     end
 
     def test_rcptto_with_address
       server = FakeServer.start
-      smtp = Net::SMTP.start 'localhost', server.port
+      smtp = Net::SMTP.start '127.0.0.1', server.port
       addr = Net::SMTP::Address.new("foo@example.com", nofty: :failure)
       assert smtp.rcptto(addr).success?
       assert_equal "RCPT TO:<foo@example.com> nofty=failure\r\n", server.commands.last
@@ -107,7 +116,7 @@ module Net
 
     def test_auth_plain
       server = FakeServer.start(auth: 'plain')
-      smtp = Net::SMTP.start 'localhost', server.port
+      smtp = Net::SMTP.start '127.0.0.1', server.port
       assert smtp.authenticate("account", "password", :plain).success?
       assert_equal "AUTH PLAIN AGFjY291bnQAcGFzc3dvcmQ=\r\n", server.commands.last
     end
@@ -184,6 +193,202 @@ module Net
       assert_nothing_raised do
         smtp.send_message("message", "sender@example.com", ["rcpt1@example.com", "rcpt2@example.com"])
       end
+    end
+
+    def test_pipelined_send_message_with_one_failed_recipient
+      scripted = start_scripted_pipelined_server(:one_recipient_failed)
+      result = scripted.smtp.send_message(
+        'message', 'sender@example.com',
+        'good1@example.com', 'bad@example.com', 'good2@example.com',
+        pipelining: true
+      )
+
+      assert_equal [
+        "MAIL FROM:<sender@example.com>",
+        "RCPT TO:<good1@example.com>",
+        "RCPT TO:<bad@example.com>",
+        "RCPT TO:<good2@example.com>",
+        "DATA"
+      ], scripted.envelope_commands
+      assert_equal '250', result[:mail].status
+      assert_equal %w[good1@example.com bad@example.com good2@example.com],
+                   result[:recipients].map { |item| item[:address] }
+      assert_equal %w[250 550 250],
+                   result[:recipients].map { |item| item[:response].status }
+      assert_equal '354', result[:data].status
+      assert result[:message].success?
+      assert_equal "message\r\n", scripted.body
+      assert_not_include scripted.commands, "RSET\r\n"
+    end
+
+    def test_pipelined_send_message_with_multiline_response
+      scripted = start_scripted_pipelined_server(:multiline_recipient)
+      result = scripted.smtp.send_message(
+        'message', 'sender@example.com',
+        'rcpt1@example.com', 'rcpt2@example.com', 'rcpt3@example.com',
+        pipelining: true
+      )
+
+      assert_equal %w[250 250 250], result[:recipients].map { |item| item[:response].status }
+      assert_equal "250-first line\n250 second line\n", result[:recipients][1][:response].string
+      assert result[:message].success?
+    end
+
+    def test_pipelined_send_message_with_all_recipients_failed
+      scripted = start_scripted_pipelined_server(:all_recipients_failed)
+      error = assert_raise(Net::SMTPFatalError) do
+        scripted.smtp.send_message(
+          'message', 'sender@example.com',
+          'bad1@example.com', 'bad2@example.com', 'bad3@example.com',
+          pipelining: true
+        )
+      end
+
+      assert_equal '550', error.response.status
+      assert_equal %w[550 450 553],
+                   error.envelope[:recipients].map { |item| item[:response].status }
+      assert_equal '451', error.envelope[:data].status
+      assert_equal '', scripted.body
+      assert_include scripted.commands, "RSET\r\n"
+      assert_equal '250', error.envelope[:mail].status
+
+      assert scripted.smtp.rset.success?
+      assert scripted.smtp.send_message('second message', 'sender@example.com', 'good@example.com').success?
+    end
+
+    def test_pipelined_data_rejected
+      scripted = start_scripted_pipelined_server(:data_rejected)
+      error = assert_raise(Net::SMTPUnknownError) do
+        scripted.smtp.send_message(
+          'message', 'sender@example.com',
+          'rcpt1@example.com', 'rcpt2@example.com', 'rcpt3@example.com',
+          pipelining: true
+        )
+      end
+
+      assert_equal '451', error.response.status
+      assert result = error.envelope
+      assert result[:mail].success?
+      assert result[:recipients].all? { |item| item[:response].success? }
+      assert_equal '', scripted.body
+      assert_include scripted.commands, "RSET\r\n"
+      assert scripted.smtp.rset.success?
+    end
+
+    def test_pipelined_mail_failed_uses_rset_after_draining_replies
+      scripted = start_scripted_pipelined_server(:mail_failed_rset)
+      error = assert_raise(Net::SMTPFatalError) do
+        scripted.smtp.send_message(
+          'message', 'sender@example.com',
+          'rcpt1@example.com', 'rcpt2@example.com', 'rcpt3@example.com',
+          pipelining: true
+        )
+      end
+
+      assert_equal '550', error.response.status
+      assert_equal %w[553 450 553],
+                   error.envelope[:recipients].map { |item| item[:response].status }
+      assert_equal '451', error.envelope[:data].status
+      assert_include scripted.commands, "RSET\r\n"
+      assert scripted.smtp.rset.success?
+    end
+
+    def test_pipelined_mail_failed_and_connection_closed
+      scripted = start_scripted_pipelined_server(:mail_failed_closed)
+      assert_raise(EOFError) do
+        scripted.smtp.send_message(
+          'message', 'sender@example.com',
+          'rcpt1@example.com', 'rcpt2@example.com', 'rcpt3@example.com',
+          pipelining: true
+        )
+      end
+
+      scripted.join
+      assert_equal [
+        "MAIL FROM:<sender@example.com>",
+        "RCPT TO:<rcpt1@example.com>",
+        "RCPT TO:<rcpt2@example.com>",
+        "RCPT TO:<rcpt3@example.com>",
+        "DATA"
+      ], scripted.envelope_commands
+      assert_not_include scripted.commands, "RSET\r\n"
+    end
+
+    def test_pipelined_data_421_closes_without_rset
+      scripted = start_scripted_pipelined_server(:data_421)
+      error = assert_raise(Net::SMTPUnknownError) do
+        scripted.smtp.send_message(
+          'message', 'sender@example.com',
+          'rcpt1@example.com', 'rcpt2@example.com', 'rcpt3@example.com',
+          pipelining: true
+        )
+      end
+
+      assert_equal '421', error.response.status
+      assert_not_include scripted.commands, "RSET\r\n"
+    end
+
+    def test_pipelining_falls_back_without_capability
+      events = []
+      socket = Object.new
+      io = Object.new
+      socket.define_singleton_method(:io) { io }
+      responses = [
+        Net::SMTP::Response.parse("250 sender ok\n"),
+        Net::SMTP::Response.parse("250 recipient ok\n"),
+        Net::SMTP::Response.parse("354 continue\n"),
+        Net::SMTP::Response.parse("250 queued\n")
+      ]
+      io.define_singleton_method(:sync) { true }
+      io.define_singleton_method(:sync=) { |value| events << [:sync, value] }
+      io.define_singleton_method(:flush) { events << :flush }
+      socket.define_singleton_method(:writeline) { |line| events << [:write, line] }
+      socket.define_singleton_method(:write) { |data| events << [:batch, data] }
+      socket.define_singleton_method(:write_message) { |message| events << [:body, message] }
+      socket.define_singleton_method(:readline) { nil }
+      socket.define_singleton_method(:closed?) { false }
+
+      smtp = Net::SMTP.new('localhost')
+      smtp.instance_variable_set(:@socket, socket)
+      smtp.instance_variable_set(:@capabilities, {})
+      reads = 0
+      smtp.define_singleton_method(:recv_response) do
+        response = responses[reads]
+        reads += 1
+        events << [:read, response.status]
+        response
+      end
+
+      result = smtp.send_message('message', 'sender@example.com', 'rcpt@example.com',
+                                 pipelining: true)
+
+      assert_equal '250', result.status
+      assert_equal [
+        [:write, 'MAIL FROM:<sender@example.com>'],
+        [:read, '250'],
+        [:write, 'RCPT TO:<rcpt@example.com>'],
+        [:read, '250'],
+        [:write, 'DATA'],
+        [:read, '354'],
+        [:sync, false],
+        [:body, 'message'],
+        :flush,
+        [:sync, true],
+        [:read, '250']
+      ], events
+    end
+
+    def test_pipelined_instance_option
+      scripted = start_scripted_pipelined_server(:one_recipient_failed)
+      scripted.smtp.pipelining = true
+      result = scripted.smtp.send_message(
+        'message', 'sender@example.com',
+        'good1@example.com', 'bad@example.com', 'good2@example.com'
+      )
+
+      assert_equal '354', result[:data].status
+      assert_equal %w[250 550 250],
+                   result[:recipient_responses].map(&:status)
     end
 
     def test_unsuccessful_send_message_server_busy
@@ -625,6 +830,12 @@ module Net
       server.start(**kw)
       server.port
     end
+
+    def start_scripted_pipelined_server(scenario)
+      server = ScriptedPipelinedServer.start(scenario)
+      self.class.scripted_servers.push(server)
+      server
+    end
   end
 
   class FakeServer
@@ -817,6 +1028,175 @@ module Net
       end
     rescue Errno::ECONNRESET, Errno::ECONNABORTED
       nil
+    end
+  end
+
+  class ScriptedPipelinedServer
+    attr_reader :commands, :body, :envelope_commands, :smtp
+
+    def self.start(scenario)
+      new(scenario).start
+    end
+
+    def initialize(scenario)
+      @scenario = scenario
+      @commands = []
+      @body = +''
+      @pipelined_envelope_pending = true
+    end
+
+    def start
+      client_read, server_write = IO.pipe
+      server_read, client_write = IO.pipe
+      smtp = Net::SMTP.new('localhost')
+      smtp.instance_variable_set(:@socket,
+                                Net::InternetMessageIO.new(DuplexIO.new(client_read, client_write),
+                                                           read_timeout: 5))
+      smtp.instance_variable_set(:@capabilities, { 'PIPELINING' => [] })
+      smtp.instance_variable_set(:@started, true)
+
+      server_write.write("220 ready\r\n")
+      smtp.send(:recv_response)
+      @smtp = smtp
+      @client_read = client_read
+      @client_write = client_write
+      @server_read = server_read
+      @server_write = server_write
+      @thread = Thread.start do
+        serve(server_read, server_write)
+      end
+      self
+    end
+
+    def join
+      @thread.join
+    end
+
+    def stop
+      @thread.kill
+      @thread.join
+      @server_read.close rescue nil
+      @server_write.close rescue nil
+      @client_read&.close rescue nil
+      @client_write&.close rescue nil
+    end
+
+    def serve(input, output)
+      loop do
+        command = input.gets
+        break unless command
+        @commands << command
+
+        case command.chomp
+        when /\AEHLO /
+          output.write("250-servername\r\n250-PIPELINING\r\n250 OK\r\n")
+        when /\AMAIL FROM:/
+          if @pipelined_envelope_pending
+            envelope = [command] + 4.times.map { input.gets }
+            envelope.each { |line| @commands << line }
+            @envelope_commands = envelope.map { |line| line.chomp("\r\n") }
+            respond_to_envelope(input, output)
+          else
+            output.write("250 sender ok\r\n")
+          end
+        when "RSET"
+          @pipelined_envelope_pending = false
+          output.write("250 reset\r\n")
+        when /\ARCPT TO:/
+          output.write("250 recipient ok\r\n")
+        when "DATA"
+          output.write("354 continue\r\n")
+          read_body(input)
+          output.write("250 queued\r\n")
+        when "QUIT"
+          output.write("221 bye\r\n")
+          break
+        end
+      end
+    rescue IOError, Errno::EPIPE
+      nil
+    ensure
+      output.close rescue nil
+    end
+
+    def respond_to_envelope(input, output)
+      case @scenario
+      when :one_recipient_failed
+        output.write("250 sender ok\r\n")
+        output.write("250 recipient ok\r\n")
+        output.write("550 recipient rejected\r\n")
+        output.write("250 recipient ok\r\n")
+        output.write("354 send content\r\n")
+        read_body(input)
+        output.write("250 queued\r\n")
+      when :multiline_recipient
+        output.write("250 sender ok\r\n")
+        output.write("250 recipient ok\r\n")
+        output.write("250-first line\r\n250 second line\r\n")
+        output.write("250 recipient ok\r\n")
+        output.write("354 send content\r\n")
+        read_body(input)
+        output.write("250 queued\r\n")
+      when :all_recipients_failed
+        output.write("250 sender ok\r\n550 mailbox unavailable\r\n450 try again\r\n553 invalid\r\n451 no valid recipients\r\n")
+      when :data_rejected
+        output.write("250 sender ok\r\n250 recipient ok\r\n250 recipient ok\r\n250 recipient ok\r\n451 data rejected\r\n")
+      when :data_421
+        output.write("250 sender ok\r\n250 recipient ok\r\n250 recipient ok\r\n250 recipient ok\r\n421 shutting down\r\n")
+      when :mail_failed_rset
+        output.write("550 sender rejected\r\n553 relay denied\r\n450 mailbox busy\r\n553 relay denied\r\n451 aborted\r\n")
+      when :mail_failed_closed
+        output.write("550 sender rejected\r\n553 relay denied\r\n450 mailbox busy\r\n")
+        output.flush
+        output.close
+        input.close
+      end
+    end
+
+    def read_body(input)
+      while (line = input.gets)
+        break if line.chomp == '.'
+        @body << line.sub(/^\./, '')
+      end
+    end
+
+    class DuplexIO
+      attr_accessor :sync
+
+      def initialize(read_io, write_io)
+        @read_io = read_io
+        @write_io = write_io
+        @sync = true
+      end
+
+      def to_io
+        @read_io
+      end
+
+      def readline
+        @read_io.readline
+      end
+
+      def read_nonblock(maxlen, outbuf = nil, exception: true)
+        @read_io.read_nonblock(maxlen, outbuf, exception: exception)
+      end
+
+      def write(data)
+        @write_io.write(data)
+      end
+
+      def write_nonblock(data, exception: true)
+        @write_io.write_nonblock(data, exception: exception)
+      end
+
+      def flush
+        @write_io.flush
+      end
+
+      def close
+        @read_io.close rescue nil
+        @write_io.close rescue nil
+      end
     end
   end
 end
